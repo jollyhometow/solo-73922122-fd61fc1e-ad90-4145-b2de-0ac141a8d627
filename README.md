@@ -1,66 +1,128 @@
-# mTLS 证书链离线诊断工具（mtls-chain-doctor）
+# 内网 DNS 区域认证副本备份（dns-zone-backup）
 
-内网 mTLS 运维排障场景：网关拒绝客户端证书时，区分两类根因——
+内网 DNS 运维场景：留存**经过 TSIG 认证**的权威区域副本，供故障后恢复解析。
+首页提供备份入口，按**启动配置**中固定的服务器、区域名与 TSIG 密钥发起
+AXFR；只有传输完整且末报文验签通过的副本才会落库，任何失败都保留旧版。
 
-1. **中间证书缺失**：叶子/中间证书的 issuer 在上传包中根本不存在；
-2. **交叉签发选链错误**：存在同名（subject DN 相同）但密钥不同、或同一公钥被不同根交叉签发的多张证书，需要**验签后区分**，且一条候选链失败不能阻止其他链被枚举。
+## 安全与完整性规则
 
-全部计算在本机离线完成，不发起任何网络请求，不检查吊销（CRL/OCSP）与证书用途（EKU）。
+### 传输（`app/axfr_client.py`）
 
-## 诊断范围与规则
+- 使用 **dnspython 手工驱动 TCP**（RFC 5936）执行 AXFR，不走 UDP。
+- TSIG 固定 **HMAC-SHA256**，按 **RFC 8945 5.3.1** 核验多报文 MAC 链：
+  首报文对请求 MAC 验签，中间报文可以不带 TSIG（运行中的 HMAC 上下文仍覆盖
+  其 wire 字节），**末报文必须带 TSIG 且验签通过**。
+- 仅接受 **SOA、NS、A** 三类记录；出现其他类型立即中止整次传输。
+- 单区**最多 1000 条**记录，超出即放弃。
+- **首尾 SOA 必须完全一致**，且收尾 SOA 必须出现在最后一个报文。
+- 全程一个 **5 秒墙钟总时限**，覆盖连接、发送与每次 recv；超时、断流、
+  连接拒绝、RCODE 错误、验签失败全部转成带中文原因的 `TransferError`。
+- 未完整通过前不向调用方返回任何数据，杜绝半成品/未认证副本入库。
 
-- 输入：1 张客户端证书（leaf）+ 1 个无序中间证书 PEM 包 + 1 张独立指定的受信根 PEM；
-  三类输入去重后**总计最多 12 张**证书。
-- 签名策略：**仅支持 RSA PKCS#1 v1.5 / SHA-256**（OID `1.2.840.113549.1.1.11`），其他算法在全局提示与逐链结果中标为不支持。
-- 从叶子出发 DFS 枚举**所有无环候选路径**（含环时只记录无环前缀，保证终止；有枚举上限保护）。
-- 同名签发者必须先验证签名：同 DN 但验签失败的证书不会进入任何链，并在「同名签发者歧义」专区列出。
-- 对每条候选链独立检查，任一链失败不影响其他链：
-  - 每张证书在给定校验时间的有效期（notBefore 含、notAfter 不含）；
-  - 每个签发者 `BasicConstraints cA=TRUE`；
-  - `KeyUsage` 扩展**存在时**必须包含 `keyCertSign`（不存在不强制）；
-  - 每个签发者的 `pathLenConstraint`（RFC 5280：只统计其下方非自颁发的中间 CA；终端实体叶子与自颁发中间证书不占 pathLen）；
-  - 链必须终止于独立指定的受信根（根的自签名同样验证）。
-- 输出：存在通过链时展示第一条通过的链；全部失败时逐条列出候选链、失败位置（链内下标）、错误码与原因；缺失签发者单独专区列出（含「同名但验签失败」明细）。
+### 提交（`app/storage.py` + `app/serial.py`）
+
+- 网络传输**全程不持有数据库写锁**；仅在完整副本已在内存中后，开启一个
+  短事务完成序列号判定与整版替换。
+- 按 **RFC 1982** 序列号算术与最新已存序列号比较：
+  - **无副本**：直接保存首版；
+  - **较新**：整版替换（zone 文件先写临时文件 fsync 再 rename，与元数据
+    在同一事务内提交，下载不可能混版）；
+  - **相同**：不改动；
+  - **较旧**：拒绝覆盖，保留已存新版；
+  - 序列号之差恰为 **2³1**：RFC 1982 未定义先后，拒绝写入。
+- 验签失败、断流、超时、进程中断均不触碰已存版本；SQLite 为 WAL 模式，
+  两个 Web 进程共享同一数据库文件，**重启后副本保留**。
+- 每次尝试（含失败原因、观测到的序列号）写入 `attempts` 审计表。
+
+### 页面（`app/main.py` + `templates/`）
+
+- 展示每个区域的 **SOA 序列号、记录数、AXFR 报文数、更新时间**。
+- 任务表展示运行/成功/失败状态与**失败原因**。
+- 每个已存副本提供 **zone 文件下载**（标准 RFC 1035 master 格式，
+  `Cache-Control: no-store`），可直接用于恢复。
+- 备份目标只来自启动配置，浏览器无法指定任意服务器或密钥。
 
 ## 快速开始（Docker Compose）
 
 ```bash
 docker compose up --build -d
-# 浏览器入口
+# 浏览器入口（仅绑定回环地址）
 open http://127.0.0.1:8080/        # Linux 可改用 xdg-open
 ```
 
-页面上点击内置示例 `cross-sign` / `all-fail` 即可自动载入 PEM 与校验时间，直接点「开始诊断」。
-容器以非 root 运行，只读根文件系统、丢弃所有 Linux capabilities、`no-new-privileges`，端口仅绑定回环地址。
+Compose 包含两个服务：
 
-停止：`docker compose down`
+| 服务 | 作用 |
+| --- | --- |
+| `auth-dns` | 本地权威源，TCP 5301–5305 五个监听，分别对应五个演示场景 |
+| `web` | 备份控制台，uvicorn **两个 worker 进程**，数据写入持久卷 `backup-data` |
 
-## 本地直接运行
+停止与清卷：
 
 ```bash
-python3 -m venv .venv && . .venv/bin/activate
+docker compose down            # 保留备份数据
+docker compose down -v         # 同时删除备份卷
+```
+
+## 演示剧本（首页按钮一一对应）
+
+1. **多报文完整传输（multi, 5301）**：区域含 66 条记录，AXFR 被拆成 4 个
+   TCP 报文，TSIG 多报文链逐报文核验；成功后显示序列号、记录数与报文数，
+   可下载 zone 文件。
+2. **末报文签名损坏（badsig, 5302）**：末报文 MAC 被篡改，验签失败并显示
+   「第 N 个报文 HMAC-SHA256 签名不匹配」，旧版保持不变。
+3. **传输中断流（truncated, 5303）**：服务器发出首报文后关闭连接，缺少
+   收尾 SOA 与末签名，判定断流并保留旧版。
+4. **服务器超时（timeout, 5305）**：只收不发，客户端 5 秒总时限到期报超时。
+5. **旧版本延迟完成（stale, 5304）**：先备份 multi 得到新版；再备份 stale，
+   传输本身完整但延迟约 2.5 秒，提交时按 RFC 1982 判定序列号较旧而拒绝，
+   已存新版不动（页面会同时显示「观测到的旧序列号」与拒绝原因）。
+
+## 启动配置
+
+| 环境变量 | 说明 | 默认 |
+| --- | --- | --- |
+| `BACKUP_DB` | SQLite 路径 | `/data/backup.db` |
+| `BACKUP_FILES_DIR` | zone 文件目录 | `/data/zones` |
+| `BACKUP_ZONE` | 区域名 | `backup.test.` |
+| `BACKUP_SERVER_HOST` | 权威服务器主机 | `auth-dns` |
+| `BACKUP_TSIG_KEY_NAME` | TSIG 密钥名 | `backup-key.backup.test.` |
+| `BACKUP_TSIG_KEY_SECRET` | base64 编码的 HMAC-SHA256 密钥 | 内置演示密钥 |
+| `BACKUP_TARGETS` | 自定义目标列表（见下） | 五个内置场景 |
+
+`BACKUP_TARGETS` 为换行或逗号分隔的条目，格式：
+
+```
+id|显示名|主机|端口|区域|密钥名|base64密钥
+```
+
+后两个密钥字段可省略，回退到 `BACKUP_TSIG_KEY_NAME/SECRET`。
+
+## 本地直接运行（不用 Docker）
+
+```bash
 pip install -r requirements.txt
-uvicorn app.main:app --host 127.0.0.1 --port 8080
+
+# 1) 本地权威源（五个场景端口 5301..5305，可用 --port-base 改基址）
+python3 -m app.auth_server --host 127.0.0.1
+
+# 2) Web 控制台（两个进程）
+uvicorn app.main:app --host 127.0.0.1 --port 8080 --workers 2
 ```
 
 ## HTTP 接口
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/` | 浏览器上传页面 |
-| POST | `/diagnose` | multipart 表单：`leaf`、`intermediates`、`root`、`validation_time`（ISO 8601，无时区按 UTC），返回 HTML 结果页 |
-| POST | `/api/diagnose` | 同入参，返回 JSON 诊断结果 |
-| GET | `/api/examples/{name}` | 取内置示例的 manifest 与 PEM 文本 |
-| GET | `/examples/{name}` | 303 跳转并由前端自动填充示例 |
-
-## 内置示例
-
-由 `scripts/generate_examples.py` 离线生成（一次性 RSA-2048 临时密钥）：
-
-- **cross-sign**：`Intermediate CA X` 的同一公钥被 Root A / Root B 交叉签发，另含一张同 DN 不同密钥的陈旧证书；Root B 被放进中间包但不是受信根。预期两条候选链，一条通过、一条因终止于不受信根而失败。
-- **all-fail**：默认叶子触发 pathLen 违规；替换 `alt-leaf-*.pem` 可分别复现签发者过期、KeyUsage 缺 keyCertSign、缺失签发者三种失败。
-
-重新生成：`python3 scripts/generate_examples.py`
+| GET | `/` | 备份控制台页面 |
+| GET | `/healthz` | 健康检查 |
+| GET | `/api/targets` | 启动配置中的备份目标（不含密钥） |
+| GET | `/api/zones` | 已存副本的序列号/记录数/报文数 |
+| POST | `/api/backups/{id}` | 异步触发备份（202，网络等待在后台线程） |
+| POST | `/api/backups/{id}/sync` | 同步触发（旧版延迟演示与测试使用） |
+| GET | `/api/jobs` / `/api/jobs/{job_id}` | 任务状态与失败原因 |
+| GET | `/api/attempts` | 历次尝试审计（含失败原因） |
+| GET | `/api/zones/{name}/download` | 下载该版本 zone 文件 |
 
 ## 测试
 
@@ -69,18 +131,22 @@ pip install -r requirements.txt
 python3 -m pytest -q
 ```
 
-覆盖：简单链通过、中间证书缺失、交叉签发同名验签区分、不因首条失败中止枚举、有效期边界、pathLen 与自颁发豁免、KeyUsage、非 CA 签发、签名算法白名单、环终止、12 张上限、去重、受信根自签名检查、Web/API 端到端。
+覆盖：RFC 1982 边界（含 2³1 歧义与序列号回绕）、多报文 TSIG 成功链、坏末签名、
+断流、5 秒超时、不支持记录类型、1000 条上限、错误密钥、整版替换与不混版、
+旧版/歧义拒绝、无副本直存、重启持久化、并发备份一致性、Web/API 端到端。
 
 ## 目录结构
 
 ```
 app/
-  diagnostics.py        # 核心：PEM 解析、建图、全路径 DFS、逐链约束校验
-  main.py               # FastAPI 路由（HTML + JSON API）
-  templates/            # Jinja2 页面
-  static/               # CSS 与示例载入脚本
-  examples/             # 内置交叉签发/全失败示例 PEM
-scripts/generate_examples.py
+  axfr_client.py    # TCP AXFR + 5 秒总时限 + RFC 8945 多报文 TSIG 核验
+  serial.py         # RFC 1982 三态比较（newer/equal/older/ambiguous）
+  storage.py        # SQLite(WAL)、短事务、原子整版替换、审计表
+  service.py        # 编排：先传输后提交，失败保留旧版
+  config.py         # 启动配置（目标、区域、TSIG 密钥）
+  auth_server.py    # 本地权威源：multi/badsig/truncated/stale/timeout
+  main.py           # FastAPI 路由、页面与下载
+  templates/ static/
 tests/
-Dockerfile, docker-compose.yml, requirements.txt
+Dockerfile  docker-compose.yml  requirements.txt
 ```

@@ -1,55 +1,78 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>mTLS 证书链离线诊断</title>
+  <title>内网 DNS 区域认证副本备份</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 <header>
-  <h1>mTLS 客户端证书链离线诊断</h1>
-  <p class="sub">区分「中间证书缺失」与「交叉签发选链错误」 · 仅支持 {{ sig_policy }} · 不检查吊销与证书用途(EKU)</p>
+  <h1>内网 DNS 区域认证副本备份</h1>
+  <p class="subtitle">TSIG（HMAC-SHA256 / RFC 8945）认证 AXFR · TCP · 总时限 5 秒 · 仅 SOA/NS/A · 单区最多 1000 条</p>
 </header>
 
 <main>
-  {% if error %}
-  <div class="banner error"><strong>输入错误：</strong>{{ error }}</div>
-  {% endif %}
-
   <section class="card">
-    <h2>载入内置示例</h2>
-    <p class="hint">示例为离线生成的交叉签发 PEM，载入后可直接点「开始诊断」。</p>
-    <div class="example-row">
-      {% for ex in examples %}
-      <button type="button" class="btn secondary load-example" data-example="{{ ex }}">{{ ex }}</button>
+    <h2>备份入口（目标来自启动配置）</h2>
+    <p class="hint">所有服务器地址、区域名与 TSIG 密钥均在进程启动时固定，页面不能指定任意目标。点击后经 TCP 执行 AXFR，首尾 SOA 一致且末报文验签通过才会入库。</p>
+    <div class="target-grid">
+      {% for t in targets %}
+      <div class="target" data-id="{{ t.target_id }}">
+        <div class="target-label">{{ t.label }}</div>
+        <div class="target-meta">{{ t.host }}:{{ t.port }} · {{ t.zone }}</div>
+        <div class="target-meta mono">TSIG: {{ t.key_name }} / hmac-sha256</div>
+        <button class="btn primary" data-backup="{{ t.target_id }}">立即备份</button>
+      </div>
       {% endfor %}
     </div>
   </section>
 
-  <form action="/diagnose" method="post" enctype="multipart/form-data" class="card">
-    <h2>诊断输入</h2>
-    <div class="grid">
-      <label>客户端证书（恰好 1 张，PEM）
-        <input type="file" name="leaf" accept=".pem,.crt,.cer,.txt" required>
-      </label>
-      <label>受信根 PEM（独立指定，恰好 1 张）
-        <input type="file" name="root" accept=".pem,.crt,.cer,.txt" required>
-      </label>
-      <label class="span2">中间证书包（无序，可多张，PEM 拼接）
-        <input type="file" name="intermediates" accept=".pem,.crt,.cer,.txt">
-      </label>
-      <label class="span2">校验时间（ISO 8601，留空则取当前 UTC；示例默认 2026-11-11T00:00:00Z）
-        <input type="text" name="validation_time" id="validation_time"
-               value="{{ default_time }}" placeholder="2026-11-11T00:00:00+00:00">
-      </label>
-    </div>
-    <p class="hint">三类输入去重后总计不得超过 12 张证书。全部计算在本机离线完成，不上传任何外部服务。</p>
-    <button type="submit" class="btn primary">开始诊断</button>
-  </form>
+  <section class="card">
+    <h2>已保存副本（重启后保留）</h2>
+    <table id="zones-table">
+      <thead>
+        <tr><th>区域</th><th>SOA 序列号</th><th>记录数</th><th>AXFR 报文数</th><th>最近更新 (UTC)</th><th>恢复文件</th></tr>
+      </thead>
+      <tbody>
+      {% for z in zones %}
+        <tr>
+          <td class="mono">{{ z.name }}</td>
+          <td class="mono">{{ z.serial }}</td>
+          <td>{{ z.record_count }}</td>
+          <td>{{ z.message_count }}</td>
+          <td class="mono">{{ z.updated_at }}</td>
+          <td><a class="btn small" href="/api/zones/{{ z.name }}/download">下载 zone 文件</a></td>
+        </tr>
+      {% else %}
+        <tr class="empty"><td colspan="6">尚无已保存副本</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>备份任务与失败原因</h2>
+    <table id="jobs-table">
+      <thead>
+        <tr><th>目标</th><th>状态</th><th>序列号</th><th>记录数</th><th>报文数</th><th>开始 (UTC)</th><th>结束 (UTC)</th><th>原因 / 提交结论</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>演示剧本</h2>
+    <ol class="playbook">
+      <li><b>多报文完整传输</b>：区域含 60+ 条记录，AXFR 被拆成多个 TCP 报文，TSIG 按多报文链核验，成功后显示序列号与记录数并可下载 zone 文件。</li>
+      <li><b>坏末签名</b>：末报文 MAC 被篡改，验签失败，页面展示失败原因，旧版（若有）保持不变。</li>
+      <li><b>断流</b>：服务器在首报文后关闭连接，缺少收尾 SOA 与末签名，判定不完整并保留旧版。</li>
+      <li><b>服务器超时</b>：服务器只收不发，客户端 5 秒总时限到期后报超时，旧版保留。</li>
+      <li><b>旧版延迟完成</b>：先对正常源备份得到新版；再对延迟 2.5 秒的旧 serial 源备份，传输本身完整，但提交时按 RFC 1982 判定为旧版而拒绝，已存新版不动。</li>
+    </ol>
+  </section>
 </main>
 
-<footer>内网运维离线工具 · FastAPI + cryptography · Docker Compose 部署</footer>
 <script src="/static/app.js"></script>
 </body>
 </html>

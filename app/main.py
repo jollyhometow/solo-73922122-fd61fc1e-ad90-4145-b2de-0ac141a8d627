@@ -1,160 +1,160 @@
-"""FastAPI web entry point for the offline mTLS chain doctor."""
+"""Web entry point: backup console, JSON API and zone file downloads.
+
+Runs under uvicorn with two worker processes (see docker-compose.yml).  Both
+workers share one SQLite database (WAL mode) and one zone-file directory on a
+persistent volume; every state-changing operation uses short, self-contained
+transactions so no coordination beyond SQLite's locking is required.
+"""
 
 from __future__ import annotations
 
-import datetime as dt
+import threading
+from dataclasses import asdict
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.requests import Request
 
-from .diagnostics import (
-    ALLOWED_SIGNATURE_LABEL,
-    DiagnosticInputError,
-    diagnose,
-    parse_pem_bundle,
-)
+from . import config
+from .service import BackupService, JobRegistry, JobView
+from .storage import Storage
 
 BASE_DIR = Path(__file__).resolve().parent
-EXAMPLES_DIR = BASE_DIR / "examples"
+
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 app = FastAPI(
-    title="mTLS 证书链离线诊断",
-    description="内网 mTLS 客户端证书链排障：区分中间证书缺失与交叉签发选链错误",
+    title="内网 DNS 区域认证副本备份",
+    description="TSIG 认证 AXFR 区域备份与恢复控制台",
+    version="1.0.0",
 )
-app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
-templates = Jinja2Templates(directory=BASE_DIR / "templates")
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+
+storage = Storage(config.db_url(), config.files_dir())
+registry = JobRegistry()
+service = BackupService(storage, registry)
+targets = {t.target_id: t for t in config.load_targets()}
 
 
-def _read_upload(f: UploadFile | None) -> bytes:
-    if f is None:
-        return b""
-    return f.file.read()
+def _job_dict(job: JobView) -> dict:
+    data = asdict(job)
+    if job.commit is not None and job.commit.stored is not None:
+        data["commit"]["stored"] = asdict(job.commit.stored)
+    return data
 
 
-def _run_diagnosis(
-    leaf_bytes: bytes,
-    intermediates_bytes: bytes,
-    root_bytes: bytes,
-    when: dt.datetime,
-):
-    leaf_certs = parse_pem_bundle(leaf_bytes)
-    root_certs = parse_pem_bundle(root_bytes)
-    intermediates = (
-        parse_pem_bundle(intermediates_bytes) if intermediates_bytes.strip() else []
-    )
-    return diagnose(leaf_certs, intermediates, root_certs, when)
+def _zone_dict(zone) -> dict:
+    return {
+        "name": zone.name,
+        "serial": zone.serial,
+        "record_count": zone.record_count,
+        "message_count": zone.message_count,
+        "created_at": zone.created_at,
+        "updated_at": zone.updated_at,
+    }
 
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> HTMLResponse:
-    examples = sorted(
-        p.name
-        for p in EXAMPLES_DIR.iterdir()
-        if p.is_dir() and (p / "manifest.json").exists()
-    )
     return templates.TemplateResponse(
         request,
         "index.html",
         {
-            "examples": examples,
-            "default_time": dt.datetime.now(dt.timezone.utc)
-            .replace(microsecond=0)
-            .isoformat(),
-            "sig_policy": ALLOWED_SIGNATURE_LABEL,
+            "targets": list(targets.values()),
+            "zones": storage.list_zones(),
         },
     )
 
 
-def _parse_when(raw: str) -> dt.datetime:
-    text = raw.strip()
-    if not text:
-        return dt.datetime.now(dt.timezone.utc)
-    when = dt.datetime.fromisoformat(text)
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=dt.timezone.utc)
-    return when.astimezone(dt.timezone.utc)
-
-
-@app.post("/diagnose", response_class=HTMLResponse)
-async def diagnose_html(
-    request: Request,
-    leaf: UploadFile | None = File(default=None),
-    intermediates: UploadFile | None = File(default=None),
-    root: UploadFile | None = File(default=None),
-    validation_time: str = Form(default=""),
-):
-    try:
-        when = _parse_when(validation_time)
-        result = _run_diagnosis(
-            _read_upload(leaf),
-            _read_upload(intermediates),
-            _read_upload(root),
-            when,
-        )
-    except (DiagnosticInputError, ValueError) as exc:
-        return templates.TemplateResponse(
-            request,
-            "index.html",
+@app.get("/api/targets")
+def api_targets() -> JSONResponse:
+    return JSONResponse(
+        [
             {
-                "error": str(exc),
-                "examples": sorted(
-                    p.name
-                    for p in EXAMPLES_DIR.iterdir()
-                    if p.is_dir() and (p / "manifest.json").exists()
-                ),
-                "default_time": validation_time,
-                "sig_policy": ALLOWED_SIGNATURE_LABEL,
-            },
-            status_code=400,
-        )
-    return templates.TemplateResponse(
-        request,
-        "result.html",
-        {"r": result, "r_dict": result.to_dict()},
+                "id": t.target_id,
+                "label": t.label,
+                "host": t.host,
+                "port": t.port,
+                "zone": t.zone,
+                "key_name": t.key_name,
+            }
+            for t in targets.values()
+        ]
     )
 
 
-@app.post("/api/diagnose")
-async def diagnose_api(
-    leaf: UploadFile | None = File(default=None),
-    intermediates: UploadFile | None = File(default=None),
-    root: UploadFile | None = File(default=None),
-    validation_time: str = Form(default=""),
-):
-    try:
-        when = _parse_when(validation_time)
-        result = _run_diagnosis(
-            _read_upload(leaf),
-            _read_upload(intermediates),
-            _read_upload(root),
-            when,
-        )
-    except (DiagnosticInputError, ValueError) as exc:
-        return JSONResponse({"error": str(exc)}, status_code=400)
-    return JSONResponse(result.to_dict())
+@app.get("/api/zones")
+def api_zones() -> JSONResponse:
+    return JSONResponse([_zone_dict(z) for z in storage.list_zones()])
 
 
-@app.get("/examples/{name}")
-def load_example(name: str):
-    """Redirect the browser to a prefilled upload form for a built-in demo."""
-    safe = Path(name).name  # strip any path components
-    manifest = EXAMPLES_DIR / safe / "manifest.json"
-    if not manifest.exists():
-        return JSONResponse({"error": f"示例 {name} 不存在"}, status_code=404)
-    return RedirectResponse(url=f"/?example={safe}", status_code=303)
+@app.get("/api/jobs")
+def api_jobs() -> JSONResponse:
+    return JSONResponse([_job_dict(j) for j in registry.list_jobs()])
 
 
-@app.get("/api/examples/{name}")
-def example_payload(name: str):
-    safe = Path(name).name
-    directory = EXAMPLES_DIR / safe
-    manifest = directory / "manifest.json"
-    if not manifest.exists():
-        return JSONResponse({"error": f"示例 {name} 不存在"}, status_code=404)
-    payload = {"manifest": manifest.read_text(encoding="utf-8"), "files": {}}
-    for pem in sorted(directory.glob("*.pem")):
-        payload["files"][pem.name] = pem.read_text(encoding="utf-8")
-    return JSONResponse(payload)
+@app.get("/api/attempts")
+def api_attempts() -> JSONResponse:
+    rows = storage.recent_attempts()
+    return JSONResponse([dict(row) for row in rows])
+
+
+@app.post("/api/backups/{target_id}")
+def create_backup(target_id: str, background_tasks: BackgroundTasks) -> JSONResponse:
+    target = targets.get(target_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="未知的备份目标（启动配置中不存在）")
+    # The transfer (up to 5 s of network waiting) runs in a worker thread
+    # without holding any database write lock.
+    background_tasks.add_task(service.run_backup, target)
+    return JSONResponse({"accepted": True, "target_id": target_id}, status_code=202)
+
+
+@app.post("/api/backups/{target_id}/sync")
+def create_backup_sync(target_id: str) -> JSONResponse:
+    """Synchronous variant used by the delayed-old-version demo and tests."""
+    target = targets.get(target_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="未知的备份目标（启动配置中不存在）")
+    job = service.run_backup(target)
+    return JSONResponse(_job_dict(job))
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: str) -> JSONResponse:
+    job = registry.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="任务不存在或已被清理")
+    return JSONResponse(_job_dict(job))
+
+
+@app.get("/api/zones/{name:path}/download")
+def download_zone(name: str) -> Response:
+    normalized = name if name.endswith(".") else name + "."
+    zone = storage.get_zone(normalized)
+    if zone is None:
+        raise HTTPException(status_code=404, detail="该区域尚无已保存副本")
+    text = storage.read_zone_file(zone)
+    filename = normalized.rstrip(".").replace(".", "_") + ".zone"
+    return PlainTextResponse(
+        text,
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            # A version is immutable once written; never let a download mix
+            # two versions through caching.
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.get("/healthz")
+def healthz() -> JSONResponse:
+    return JSONResponse({"ok": True})
+
+
+# Exposed for tests that want to exercise concurrency primitives directly.
+__all__ = ["app", "storage", "registry", "service", "targets"]

@@ -1,12 +1,47 @@
 services:
-  mtls-chain-doctor:
+  # Local authoritative source: five TCP listeners, one per demo scenario.
+  auth-dns:
     build:
       context: .
       dockerfile: Dockerfile
-    image: mtls-chain-doctor:1.0.0
-    container_name: mtls-chain-doctor
+    image: dns-zone-backup:1.0.0
+    container_name: dns-zone-backup-auth
+    command: ["python", "-m", "app.auth_server", "--host", "0.0.0.0"]
+    environment:
+      BACKUP_TSIG_KEY_NAME: backup-key.backup.test.
+      BACKUP_TSIG_KEY_SECRET: ZGVtby10c2lnLXNlY3JldC0zMmJ5dGVzLWxvbmchISE=
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - backup-net
+    # No host port mapping: only the web container may reach the DNS source.
+
+  # Backup console: uvicorn runs two worker processes against one shared DB.
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dns-zone-backup:1.0.0
+    container_name: dns-zone-backup-web
     ports:
       - "127.0.0.1:8080:8080"
+    environment:
+      BACKUP_DB: /data/backup.db
+      BACKUP_FILES_DIR: /data/zones
+      BACKUP_SERVER_HOST: auth-dns
+      BACKUP_ZONE: backup.test.
+      BACKUP_TSIG_KEY_NAME: backup-key.backup.test.
+      BACKUP_TSIG_KEY_SECRET: ZGVtby10c2lnLXNlY3JldC0zMmJ5dGVzLWxvbmchISE=
+    volumes:
+      - backup-data:/data
+    depends_on:
+      - auth-dns
     restart: unless-stopped
     read_only: true
     tmpfs:
@@ -16,7 +51,15 @@ services:
     cap_drop:
       - ALL
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/', timeout=4).status==200 else 1)"]
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=4).status==200 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 3
+    networks:
+      - backup-net
+
+volumes:
+  backup-data:
+
+networks:
+  backup-net:

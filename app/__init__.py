@@ -1,1 +1,3 @@
-"""mTLS chain doctor - offline client certificate chain diagnostics."""
+"""DNS zone authenticated backup application."""
+
+__version__ = "1.0.0"
